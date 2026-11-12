@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Study Monitor v3.0: individual eye calibration + moving-mean EAR + head nods.
+"""Study Monitor v3.1: individual eye calibration + moving-mean EAR + head nods.
 
 The Raspberry Pi does the sensing and JSON construction; MQTT is PRESERVED
 but only connects when --mqtt-host is specified.  No UNO Q is needed for tests.
@@ -26,7 +26,7 @@ from pathlib import Path
 from statistics import fmean, median
 import time
 
-VERSION = "3.0"
+VERSION = "3.1"
 EYE_LEFT = (33, 160, 158, 133, 153, 144)
 EYE_RIGHT = (362, 385, 387, 263, 373, 380)
 
@@ -282,6 +282,12 @@ class StudyMonitor:
         self.previous_eye = None
         self.closed_since = None
         self.open_since = None
+        # Recovery is based on accumulated reliable OPEN evidence.  The older
+        # 2-second consecutive-open timer was frequently reset by a single
+        # AMBIGUOUS/NO_FACE frame, trapping the monitor in Dozzy.
+        self.recovery_first_open = None
+        self.recovery_last_open = None
+        self.recovery_open_seconds = 0.0
         self.perclos = 0.0
         self.doze_time = 0.0
         self.nods = NodDetector(profile.get("baseline_pitch"), down_sign=nod_sign,
@@ -294,6 +300,21 @@ class StudyMonitor:
         self.previous_eye = None
         self.closed_since = None
         self.open_since = None
+
+    def _reset_recovery(self):
+        self.recovery_first_open = None
+        self.recovery_last_open = None
+        self.recovery_open_seconds = 0.0
+
+    def _record_recovery_open(self, t):
+        # Allow occasional unusable frames but do not count long unknown gaps
+        # as proof that eyes remained open.
+        if self.recovery_last_open is None or t - self.recovery_last_open > 0.65:
+            self.recovery_first_open = t
+            self.recovery_open_seconds = 0.0
+        else:
+            self.recovery_open_seconds += min(t - self.recovery_last_open, 0.35)
+        self.recovery_last_open = t
 
     def snapshot(self, t, status, valid, reason, eye_status="UNKNOWN",
                  left=None, right=None, face=False):
@@ -311,6 +332,7 @@ class StudyMonitor:
             "EyeFilter": "moving_mean_3",
             "HeadFilter": "moving_mean_5",
             "EyeStatus": eye_status,
+            "RecoveryOpenSeconds": round(self.recovery_open_seconds, 2),
             "TrackingStatus": status,
             "DecisionValid": bool(valid),
             "DecisionReason": reason,
@@ -331,11 +353,14 @@ class StudyMonitor:
             # Eyes cannot be measured, but a visible face is NOT an empty seat.
             self._eye_reset()
             self.last_valid_frame = None
+            if self.recovery_last_open is not None and t - self.recovery_last_open > 0.65:
+                self._reset_recovery()
             if not face and (self.last_face is None or t - self.last_face >= self.no_face_timeout):
                 self.state = "Empty"
                 self.doze_time = 0.0
                 self.history.clear()
                 self.perclos = 0.0
+                self._reset_recovery()
                 return self.snapshot(t, "NO_FACE_TIMEOUT", False,
                                      "No face observed for 4s; cannot verify actual absence", face=False)
             if self.state == "Empty" and face:
@@ -357,7 +382,11 @@ class StudyMonitor:
         th_l = self.profile["threshold_left"]
         th_r = self.profile["threshold_right"]
         closed = filtered_l <= th_l and filtered_r <= th_r
-        opened = filtered_l >= th_l * 1.10 and filtered_r >= th_r * 1.10
+        # Small-eye/lighting tolerance. One eye may be slightly nearer its
+        # threshold, but the other must be very clearly open.
+        ratios = (filtered_l / th_l, filtered_r / th_r)
+        opened = (min(ratios) >= 1.03 or
+                  (min(ratios) >= 0.95 and max(ratios) >= 1.30))
         eye_status = "CLOSED" if closed else "OPEN" if opened else "AMBIGUOUS"
         if self.state == "Empty":
             self.state = "Study"
@@ -367,6 +396,8 @@ class StudyMonitor:
             self.closed_since = None
             self.open_since = None
             self.last_valid_frame = None
+            if self.recovery_last_open is not None and t - self.recovery_last_open > 0.65:
+                self._reset_recovery()
             return self.snapshot(t, "EYE_STATE_AMBIGUOUS", False,
                                  "One eye closed or EAR near threshold", eye_status,
                                  filtered_l, filtered_r, True)
@@ -385,6 +416,7 @@ class StudyMonitor:
         self.perclos = closed_seconds / sample_seconds if sample_seconds > 0 else 0.0
 
         if closed:
+            self._reset_recovery()
             if self.closed_since is None:
                 self.closed_since = t
             self.open_since = None
@@ -396,6 +428,8 @@ class StudyMonitor:
                 self.closed_since = None
             if self.open_since is None:
                 self.open_since = t
+            if self.state == "Dozzy":
+                self._record_recovery_open(t)
         closed_for = (t - self.closed_since) if self.closed_since is not None else 0.0
         recent_nods = self.last_movement["NodCount"]
         assisted = recent_nods >= 1 and closed_for >= self.assisted_close_seconds
@@ -408,6 +442,7 @@ class StudyMonitor:
         if self.state == "Study" and drowsy:
             self.state = "Dozzy"
             self.doze_time = 0.0
+            self._reset_recovery()
             if closed_for >= self.close_seconds:
                 reason = "Eyes closed longer than threshold"
             elif assisted:
@@ -415,12 +450,20 @@ class StudyMonitor:
             else:
                 reason = "High PERCLOS and currently closed eyes"
         elif self.state == "Dozzy":
-            if opened and self.open_since is not None and t - self.open_since >= self.recovery_seconds:
+            # Require enough *measured* open-eye time over at least 2s,
+            # tolerating momentary failed/ambiguous frames. Any definite
+            # CLOSED sample cancels the recovery evidence.
+            span = (t - self.recovery_first_open
+                    if self.recovery_first_open is not None else 0.0)
+            if (opened and span >= self.recovery_seconds
+                    and self.recovery_open_seconds >= self.recovery_seconds * 0.70):
                 self.state = "Study"
                 self.doze_time = 0.0
-                reason = "Eyes reopened for recovery interval"
+                self._reset_recovery()
+                reason = "RECOVERED: eyes reliably open after Dozzy"
             else:
-                reason = "Dozzy; waiting for sustained recovery"
+                reason = ("Dozzy: checking open eyes "
+                          f"({self.recovery_open_seconds:.1f}s evidence)")
         elif self.last_movement["HeadMovement"] == "HEAD_DOWN_HELD_NOT_NOD":
             reason = "Static head lowered (thinking/reading possible); not drowsy by posture"
         elif recent_nods >= 2 and not drowsy:
@@ -464,13 +507,39 @@ def summarize(path):
     print("  This is a diagnostic log, NOT an accuracy score without labelled trials.")
 
 
+def draw_eye_landmarks(frame, cv2, landmarks, eye_status="UNKNOWN"):
+    """Visible landmarks on both eyes for live and recorded-video diagnosis."""
+    if not landmarks:
+        return
+    h, w = frame.shape[:2]
+    # Open=green, closed=red, uncertain/calibrating=yellow.
+    color = ((0, 210, 0) if eye_status == "OPEN" else
+             (0, 0, 255) if eye_status == "CLOSED" else (0, 210, 255))
+    pts = landmarks[0]
+    for ids in (EYE_LEFT, EYE_RIGHT):
+        pixels = [(int(pts[i].x * w), int(pts[i].y * h)) for i in ids]
+        # Draw two arcs (upper and lower eyelid), not the inaccurate
+        # consecutive-index zigzag.
+        for arc in (pixels[:4], [pixels[0], pixels[5], pixels[4], pixels[3]]):
+            for pa, pb in zip(arc, arc[1:]):
+                cv2.line(frame, pa, pb, color, 1, cv2.LINE_AA)
+        for xy in pixels:
+            cv2.circle(frame, xy, 2, color, -1, cv2.LINE_AA)
+
+
 def overlay(frame, cv2, lines):
-    for index, line in enumerate(lines):
-        pt = (10, 27 + index * 25)
-        cv2.putText(frame, line, pt, cv2.FONT_HERSHEY_SIMPLEX,
-                    0.50, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(frame, line, pt, cv2.FONT_HERSHEY_SIMPLEX,
-                    0.50, (0, 255, 255), 1, cv2.LINE_AA)
+    h, w = frame.shape[:2]
+    scale = 0.48 if w >= 640 else 0.39
+    step = 24 if h >= 360 else 19
+    # Solid translucent backing improves legibility against faces/walls.
+    panel_h = min(h, 13 + step * len(lines))
+    bg = frame.copy()
+    cv2.rectangle(bg, (0, 0), (w, panel_h), (0, 0, 0), -1)
+    cv2.addWeighted(bg, 0.60, frame, 0.40, 0, frame)
+    for i, line in enumerate(lines):
+        cv2.putText(frame, line, (8, 19 + i * step),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale,
+                    (0, 255, 255), 1, cv2.LINE_AA)
 
 
 def parse_args():
@@ -631,6 +700,7 @@ def main():
                     matrices = getattr(detected, "facial_transformation_matrixes", None)
                     matrix = matrices[0] if matrices is not None and len(matrices) else None
                     obs = observe(detected.face_landmarks, w, h, matrix)
+                    eye_display_status = "UNKNOWN"
                     if calibrator is not None and calibrator.profile is None:
                         calibrator.add(t, obs)
                         line = (f"CALIBRATING {calibrator.elapsed(t):.1f}/"
@@ -653,20 +723,34 @@ def main():
                                                    assisted_close_seconds=args.assisted_close_seconds,
                                                    no_face_timeout=args.no_face_timeout)
                             print("[CALIBRATION OK] " + json.dumps(profile), flush=True)
-                        lines = [line, "OPEN BOTH EYES / KEEP HEAD NEUTRAL"]
+                        lines = [
+                            f"CALIBRATE EYES {calibrator.elapsed(t):.1f}/{args.calibration_seconds:.0f}s",
+                            f"Samples:{len(calibrator.eyes)} Track:{obs['status']}",
+                            "Keep both eyes naturally OPEN",
+                        ]
                     else:
+                        prior_state = monitor.state
                         rec = monitor.update(t, obs)
+                        eye_display_status = rec["EyeStatus"]
+                        if rec["StudentState"] != prior_state:
+                            print(f"[STATE] {prior_state} -> {rec['StudentState']} "
+                                  f"| eyes={rec['EyeStatus']} "
+                                  f"| reason={rec['DecisionReason']}", flush=True)
+                            last_sent = None  # Always include transitions in JSONL.
                         emit(t, rec)
                         lines = [
-                            f"v{VERSION} {rec['StudentState']} Doze:{rec['DozeTime']:.1f}s "
-                            f"Blinks:{rec['BlinkCount']} Valid:{rec['DecisionValid']}",
-                            f"EYE {rec['EyeStatus']} L:{rec['EAR_Left']}/{rec['EAR_Threshold_Left']:.3f} "
-                            f"R:{rec['EAR_Right']}/{rec['EAR_Threshold_Right']:.3f}",
-                            f"HEAD {rec['HeadMovement']} delta:{rec['HeadDownAngle']} "
-                            f"nods:{rec['NodCount']}",
-                            f"Tracking: {rec['TrackingStatus']}",
+                            f"v{VERSION} {rec['StudentState']} / EYES {rec['EyeStatus']}",
+                            f"L:{rec['EAR_Left']}({rec['EAR_Threshold_Left']:.3f}) "
+                            f"R:{rec['EAR_Right']}({rec['EAR_Threshold_Right']:.3f})",
+                            f"HEAD:{rec['HeadDownAngle']} deg   NODS:{rec['NodTotal']}",
+                            f"Doze:{rec['DozeTime']:.1f}s  Open:{rec['RecoveryOpenSeconds']:.1f}s",
+                            f"Track:{rec['TrackingStatus']} Valid:{rec['DecisionValid']}",
                         ]
                     if not args.no_display or args.record_video:
+                        # Landmarks are drawn even during calibration; do not
+                        # confuse seeing landmarks with reliable measurements.
+                        draw_eye_landmarks(frame, cv2, detected.face_landmarks,
+                                           eye_display_status)
                         overlay(frame, cv2, lines)
                     if args.record_video:
                         if writer is None:
