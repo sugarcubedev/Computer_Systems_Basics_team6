@@ -3,7 +3,7 @@
 Based on the user's original working study_monitor.py.
 Current scope:
   1. Ten seconds of person-specific LEFT/RIGHT eye-open calibration.
-  2. Reliable transition from Dozzy back to Study after eyes reopen.
+  2. Reliable eye reopening with normalized LEFT/RIGHT evidence after a blink or long closure.
   3. EAR smoothing (3-frame moving mean) and visible eye landmarks.
   4. Honest UNKNOWN tracking status; PERCLOS is diagnostic only.
 
@@ -28,7 +28,7 @@ import time
 
 from mqtt_sender import MQTTSender
 
-VERSION = '4.0-eye-only'
+VERSION = '4.1-eye-only'
 EYE_LEFT = (33, 160, 158, 133, 153, 144)
 EYE_RIGHT = (362, 385, 387, 263, 373, 380)
 
@@ -134,7 +134,8 @@ class StudyMonitor:
     """Eye-only state machine. PERCLOS never drives state transitions."""
 
     def __init__(self, profile, closed_seconds=10.0, recovery_seconds=0.5,
-                 mean_window=3, no_face_seconds=4.0):
+                 mean_window=3, no_face_seconds=4.0,
+                 recovery_mean_ratio=0.72, recovery_min_ratio=0.60):
         self.profile = profile
         self.closed_seconds = closed_seconds
         self.recovery_seconds = recovery_seconds
@@ -143,6 +144,12 @@ class StudyMonitor:
         self.close_right = profile['threshold_right']
         self.open_left = profile['reopen_threshold_left']
         self.open_right = profile['reopen_threshold_right']
+        # Normalize each eye by its own baseline; do not require both eyes to
+        # independently clear the strict (0.8x) reopen threshold.
+        self.baseline_left = profile.get('baseline_left', self.close_left / 0.70)
+        self.baseline_right = profile.get('baseline_right', self.close_right / 0.70)
+        self.recovery_mean_ratio = recovery_mean_ratio
+        self.recovery_min_ratio = recovery_min_ratio
         self.mean_left = deque(maxlen=mean_window)
         self.mean_right = deque(maxlen=mean_window)
         self.state = 'Empty'
@@ -166,9 +173,21 @@ class StudyMonitor:
         self.mean_right.append(right)
         avg_left = sum(self.mean_left) / len(self.mean_left)
         avg_right = sum(self.mean_right) / len(self.mean_right)
+        # Strong evidence (both eyes) remains the first, conservative criterion.
+        # The second OPEN criterion handles asymmetric/below-baseline eyes:
+        # one eye may remain below its strict 0.8x baseline open threshold even
+        # though BOTH eyes have visibly reopened. Require both eyes to be at
+        # least 0.60x their individual baselines, and their normalized mean to
+        # exceed 0.72. A momentary measurement does NOT recover the state;
+        # the existing 0.5 s open-duration rule must still be satisfied.
+        ratio_left = avg_left / self.baseline_left if self.baseline_left > 0 else 0.0
+        ratio_right = avg_right / self.baseline_right if self.baseline_right > 0 else 0.0
+        strong_open = avg_left >= self.open_left and avg_right >= self.open_right
+        balanced_open = (min(ratio_left, ratio_right) >= self.recovery_min_ratio
+                         and (ratio_left + ratio_right) / 2 >= self.recovery_mean_ratio)
         if avg_left <= self.close_left and avg_right <= self.close_right:
             label = 'CLOSED'
-        elif avg_left >= self.open_left and avg_right >= self.open_right:
+        elif strong_open or balanced_open:
             label = 'OPEN'
         else:
             label = 'UNCERTAIN'
@@ -260,6 +279,8 @@ class StudyMonitor:
             'EAR_Threshold_Right': self.close_right,
             'EAR_Reopen_Left': self.open_left,
             'EAR_Reopen_Right': self.open_right,
+            'ReopenMeanRatio': self.recovery_mean_ratio,
+            'ReopenMinRatio': self.recovery_min_ratio,
             'EyeStatus': eye,
             'ClosedSeconds': round(self.closed_duration, 2),
             'OpenSeconds': round(self.open_duration, 2),
@@ -300,6 +321,10 @@ def build_parser():
     p.add_argument('--closed-seconds', type=float, default=10.0)
     p.add_argument('--recovery-seconds', type=float, default=0.5)
     p.add_argument('--mean-window', type=int, default=3)
+    p.add_argument('--recovery-mean-ratio', type=float, default=0.72,
+                   help='normalized two-eye mean required for OPEN; default 0.72')
+    p.add_argument('--recovery-min-ratio', type=float, default=0.60,
+                   help='minimum normalized value in EACH eye for OPEN; default 0.60')
     p.add_argument('--profile', default='ear_profile.json')
     p.add_argument('--log-dir', default='runs')
     p.add_argument('--no-calibration', action='store_true', help='fallback to fixed --threshold; not recommended')
@@ -319,7 +344,9 @@ def run_simulation(args):
         'threshold_left': 0.14, 'threshold_right': 0.126,
         'reopen_threshold_left': 0.16, 'reopen_threshold_right': 0.144,
     }
-    mon = StudyMonitor(profile, args.closed_seconds, args.recovery_seconds, args.mean_window)
+    mon = StudyMonitor(profile, args.closed_seconds, args.recovery_seconds,
+                       args.mean_window, recovery_mean_ratio=args.recovery_mean_ratio,
+                       recovery_min_ratio=args.recovery_min_ratio)
     previous = mon.state
     for i in range(200):
         t = i * 0.1
@@ -344,6 +371,8 @@ def main():
         parser.error('Time thresholds must be positive')
     if not (1 <= args.mean_window <= 15):
         parser.error('--mean-window must be from 1 to 15')
+    if not (0 < args.recovery_min_ratio <= args.recovery_mean_ratio < 1):
+        parser.error('Require 0 < recovery-min-ratio <= recovery-mean-ratio < 1')
     if args.simulate:
         run_simulation(args)
         return
@@ -373,7 +402,9 @@ def main():
             'reopen_threshold_left': args.threshold * (args.ear_open_ratio / args.ear_close_ratio),
             'reopen_threshold_right': args.threshold * (args.ear_open_ratio / args.ear_close_ratio),
         }
-        mon = StudyMonitor(profile, args.closed_seconds, args.recovery_seconds, args.mean_window)
+        mon = StudyMonitor(profile, args.closed_seconds, args.recovery_seconds,
+                       args.mean_window, recovery_mean_ratio=args.recovery_mean_ratio,
+                       recovery_min_ratio=args.recovery_min_ratio)
 
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -427,7 +458,9 @@ def main():
                         if became_ready:
                             profile_path.write_text(json.dumps(calibrator.profile, indent=2) + '\n', encoding='utf-8')
                             mon = StudyMonitor(calibrator.profile, args.closed_seconds,
-                                               args.recovery_seconds, args.mean_window)
+                                               args.recovery_seconds, args.mean_window,
+                                               recovery_mean_ratio=args.recovery_mean_ratio,
+                                               recovery_min_ratio=args.recovery_min_ratio)
                             print('[CALIBRATION OK] ' + json.dumps(calibrator.profile), flush=True)
                             print('[TEST] OPEN -> CLOSED 3s -> OPEN (Study); then CLOSED 11s -> OPEN (Study).', flush=True)
                         else:
