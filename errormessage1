@@ -1,0 +1,41 @@
+rssaem@rssaem:~/Downloads/StudyMonitor_Autostart_Integration/raspberry_pi$ sudo journalctl -u study-monitor.service -n 40 --no-pager
+Nov 19 17:37:54 rssaem python[4612]: [CALIBRATION] Look straight at camera with eyes naturally OPEN for 10s.
+Nov 19 17:37:54 rssaem python[4612]: [LOG] runs/study_20261119_173754.jsonl
+Nov 19 17:37:57 rssaem python[4612]: [LOG SAVED] runs/study_20261119_173754.jsonl
+Nov 19 17:37:57 rssaem python[4612]: Traceback (most recent call last):
+Nov 19 17:37:57 rssaem python[4612]:   File "/home/rssaem/mediapipe_test/mqtt_sender.py", line 47, in connect
+Nov 19 17:37:57 rssaem python[4612]:     self.client.connect(self.host, self.port, keepalive=30)
+Nov 19 17:37:57 rssaem python[4612]:   File "/home/rssaem/edgeai-venv/lib/python3.12/site-packages/paho/mqtt/client.py", line 1435, in connect
+Nov 19 17:37:57 rssaem python[4612]:     return self.reconnect()
+Nov 19 17:37:57 rssaem python[4612]:            ^^^^^^^^^^^^^^^^
+Nov 19 17:37:57 rssaem python[4612]:   File "/home/rssaem/edgeai-venv/lib/python3.12/site-packages/paho/mqtt/client.py", line 1598, in reconnect
+Nov 19 17:37:57 rssaem python[4612]:     self._sock = self._create_socket()
+Nov 19 17:37:57 rssaem python[4612]:                  ^^^^^^^^^^^^^^^^^^^^^
+Nov 19 17:37:57 rssaem python[4612]:   File "/home/rssaem/edgeai-venv/lib/python3.12/site-packages/paho/mqtt/client.py", line 4609, in _create_socket
+Nov 19 17:37:57 rssaem python[4612]:     sock = self._create_socket_connection()
+Nov 19 17:37:57 rssaem python[4612]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Nov 19 17:37:57 rssaem python[4612]:   File "/home/rssaem/edgeai-venv/lib/python3.12/site-packages/paho/mqtt/client.py", line 4640, in _create_socket_connection
+Nov 19 17:37:57 rssaem python[4612]:     return socket.create_connection(addr, timeout=self._connect_timeout, source_address=source)
+Nov 19 17:37:57 rssaem python[4612]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Nov 19 17:37:57 rssaem python[4612]:   File "/usr/lib/python3.12/socket.py", line 852, in create_connection
+Nov 19 17:37:57 rssaem python[4612]:     raise exceptions[0]
+Nov 19 17:37:57 rssaem python[4612]:   File "/usr/lib/python3.12/socket.py", line 837, in create_connection
+Nov 19 17:37:57 rssaem python[4612]:     sock.connect(sa)
+Nov 19 17:37:57 rssaem python[4612]: OSError: [Errno 113] No route to host
+Nov 19 17:37:57 rssaem python[4612]: The above exception was the direct cause of the following exception:
+Nov 19 17:37:57 rssaem python[4612]: Traceback (most recent call last):
+Nov 19 17:37:57 rssaem python[4612]:   File "/home/rssaem/mediapipe_test/study_monitor.py", line 617, in <module>
+Nov 19 17:37:57 rssaem python[4612]:     main()
+Nov 19 17:37:57 rssaem python[4612]:   File "/home/rssaem/mediapipe_test/study_monitor.py", line 459, in main
+Nov 19 17:37:57 rssaem python[4612]:     sender.connect()
+Nov 19 17:37:57 rssaem python[4612]:   File "/home/rssaem/mediapipe_test/mqtt_sender.py", line 49, in connect
+Nov 19 17:37:57 rssaem python[4612]:     raise ConnectionError(
+Nov 19 17:37:57 rssaem python[4612]: ConnectionError: MQTT Broker unreachable: 10.42.0.173:1883 ([Errno 113] No route to host)
+Nov 19 17:37:57 rssaem systemd[1]: study-monitor.service: Main process exited, code=exited, status=1/FAILURE
+Nov 19 17:37:57 rssaem systemd[1]: study-monitor.service: Failed with result 'exit-code'.
+Nov 19 17:37:57 rssaem systemd[1]: study-monitor.service: Consumed 1.737s CPU time.
+Nov 19 17:38:05 rssaem systemd[1]: study-monitor.service: Scheduled restart job, restart counter is at 3.
+Nov 19 17:38:05 rssaem systemd[1]: Started study-monitor.service - Study Monitor - camera calibration + UNO Q MQTT.
+Nov 19 17:38:06 rssaem python[4633]: [START] Study Monitor v4.1-eye-only-lcd1
+Nov 19 17:38:06 rssaem python[4633]: [CALIBRATION] Look straight at camera with eyes naturally OPEN for 10s.
+Nov 19 17:38:06 rssaem python[4633]: [LOG] runs/study_20261119_173806.jsonl
